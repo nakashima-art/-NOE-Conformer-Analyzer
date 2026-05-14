@@ -70,11 +70,56 @@ def read_sdf(uploaded_file, sanitize=False):
 
 
 def get_available_sdf_properties(mols):
+    """
+    Get SDF properties that are likely to contain conformer energies.
+    Population-related properties are excluded.
+    """
     prop_names = set()
+
     for mol in mols:
         for prop_name in mol.GetPropNames():
             prop_names.add(prop_name)
-    return sorted(prop_names)
+
+    prop_names = sorted(prop_names)
+
+    # Exclude properties that are clearly not energies
+    excluded_keywords = [
+        "POPULATION",
+        "BOLTZMANN",
+        "RATIO",
+        "PERCENT",
+        "%",
+    ]
+
+    energy_like_keywords = [
+        "ENERGY",
+        "GIBBS",
+        "FREE",
+        "SCF",
+        "POTENTIAL",
+        "ELECTRONIC",
+    ]
+
+    energy_props = []
+
+    for prop in prop_names:
+        prop_upper = prop.upper()
+
+        if any(keyword in prop_upper for keyword in excluded_keywords):
+            continue
+
+        if any(keyword in prop_upper for keyword in energy_like_keywords):
+            energy_props.append(prop)
+
+    # If no energy-like properties are found, fall back to all properties
+    # except obvious population properties.
+    if not energy_props:
+        energy_props = [
+            prop for prop in prop_names
+            if not any(keyword in prop.upper() for keyword in excluded_keywords)
+        ]
+
+    return energy_props
 
 
 def extract_energy_from_property(mol, property_name):
@@ -632,19 +677,45 @@ if not available_props:
     )
     st.stop()
 
+# Prefer common energy properties if present
+preferred_energy_props = [
+    "TOTAL_GIBBS_FREE_ENERGY_KCAL/MOL",
+    "POTENTIAL_ENERGY_KCAL/MOL",
+    "SCF_ENERGY",
+    "SCF_ENERGY_HARTREE",
+    "GIBBS_FREE_ENERGY",
+]
+
+default_energy_index = 0
+for preferred in preferred_energy_props:
+    if preferred in available_props:
+        default_energy_index = available_props.index(preferred)
+        break
+
 energy_property = st.selectbox(
     "SDF property containing energy values",
     available_props,
+    index=default_energy_index,
     help=(
-        "Select the SDF property that contains SCF energy or Gibbs free energy. "
-        "The first numeric value in the property is used."
+        "Select the SDF property that contains SCF energy, potential energy, "
+        "or Gibbs free energy. Do not select Boltzmann population."
     ),
 )
+
+# Guess energy unit from property name
+energy_property_upper = energy_property.upper()
+
+if "KCAL" in energy_property_upper:
+    default_unit_index = 1  # kcal/mol
+elif "KJ" in energy_property_upper:
+    default_unit_index = 2  # kJ/mol
+else:
+    default_unit_index = 0  # Hartree
 
 energy_unit = st.radio(
     "Energy unit",
     ["Hartree", "kcal/mol", "kJ/mol"],
-    index=0,
+    index=default_unit_index,
     horizontal=True,
 )
 
