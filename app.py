@@ -1,6 +1,6 @@
 import math
 import re
-from io import StringIO
+from io import BytesIO
 
 import altair as alt
 import pandas as pd
@@ -58,12 +58,14 @@ def make_atom_index_preview(mol):
 
 
 def read_sdf(uploaded_file, sanitize=False):
-    sdf_text = uploaded_file.getvalue().decode("utf-8", errors="replace")
+    sdf_bytes = uploaded_file.getvalue()
+
     supplier = Chem.ForwardSDMolSupplier(
-        StringIO(sdf_text),
+        BytesIO(sdf_bytes),
         sanitize=sanitize,
         removeHs=False,
     )
+
     return [mol for mol in supplier if mol is not None]
 
 
