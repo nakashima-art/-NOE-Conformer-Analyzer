@@ -9,7 +9,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 
-APP_VERSION = "ver. 1.1"
+APP_VERSION = "ver. 1.2"
 
 R_KCAL = 0.00198720425864083  # kcal mol^-1 K^-1
 
@@ -82,7 +82,6 @@ def get_available_sdf_properties(mols):
 
     prop_names = sorted(prop_names)
 
-    # Exclude properties that are clearly not energies
     excluded_keywords = [
         "POPULATION",
         "BOLTZMANN",
@@ -111,8 +110,6 @@ def get_available_sdf_properties(mols):
         if any(keyword in prop_upper for keyword in energy_like_keywords):
             energy_props.append(prop)
 
-    # If no energy-like properties are found, fall back to all properties
-    # except obvious population properties.
     if not energy_props:
         energy_props = [
             prop for prop in prop_names
@@ -225,6 +222,8 @@ def distance_to_score(distance):
 
 
 def classify_effective_distance(r_eff):
+    if r_eff is None or pd.isna(r_eff):
+        return "not calculated"
     if r_eff <= 2.5:
         return "strong NOE likely"
     if r_eff <= 3.0:
@@ -235,6 +234,89 @@ def classify_effective_distance(r_eff):
         return "borderline"
     return "unlikely"
 
+
+def interpret_noe_likelihood(score_percent, normalized_distance):
+    """
+    Generate an intuitive interpretation of the NOE likelihood score.
+    The score is empirical and should not be interpreted as a true probability.
+    """
+    if normalized_distance is not None and pd.notna(normalized_distance):
+        if normalized_distance > 4.0:
+            return {
+                "level": "NOE unlikely",
+                "style": "error",
+                "comment": (
+                    "The normalized effective H···H distance is longer than 4.0 Å. "
+                    "A clear NOE correlation is unlikely under typical conditions."
+                ),
+            }
+
+    if score_percent >= 80:
+        return {
+            "level": "Strong NOE likely",
+            "style": "success",
+            "comment": (
+                "This proton pair is predicted to have a high likelihood of showing "
+                "a NOE correlation. A relatively clear NOE may be expected."
+            ),
+        }
+
+    if score_percent >= 60:
+        return {
+            "level": "Moderate NOE likely",
+            "style": "success",
+            "comment": (
+                "This proton pair is predicted to have a moderate likelihood of showing "
+                "a NOE correlation. The NOE may be observable depending on experimental conditions."
+            ),
+        }
+
+    if score_percent >= 30:
+        return {
+            "level": "Weak or possible NOE",
+            "style": "info",
+            "comment": (
+                "This proton pair may show a weak NOE correlation, but a strong NOE is not expected. "
+                "The result should be interpreted together with the effective distance and conformer populations."
+            ),
+        }
+
+    if score_percent >= 10:
+        return {
+            "level": "Borderline",
+            "style": "warning",
+            "comment": (
+                "This proton pair is borderline. A NOE correlation may be weak or difficult to observe, "
+                "especially if the experimental sensitivity is limited."
+            ),
+        }
+
+    return {
+        "level": "NOE unlikely",
+        "style": "error",
+        "comment": (
+            "This proton pair has a low NOE likelihood score. A NOE correlation is unlikely "
+            "under typical conditions."
+        ),
+    }
+
+
+def show_interpretation_box(interpretation):
+    text = f"**{interpretation['level']}**\n\n{interpretation['comment']}"
+
+    if interpretation["style"] == "success":
+        st.success(text)
+    elif interpretation["style"] == "info":
+        st.info(text)
+    elif interpretation["style"] == "warning":
+        st.warning(text)
+    else:
+        st.error(text)
+
+
+# =========================
+# NOE calculation
+# =========================
 
 def validate_atom_group(atom_group, mol, group_name, pair_name, mol_name):
     if not atom_group:
@@ -265,9 +347,6 @@ def calculate_noe_for_group_pairs(
 
     For each conformer:
         group_r6_sum = sum over all A-B combinations of r^-6
-
-    Then:
-        total weighted r^-6 = sum_i population_i * group_r6_sum_i
     """
     detailed_rows = []
     pairwise_rows = []
@@ -324,7 +403,6 @@ def calculate_noe_for_group_pairs(
 
                     group_r6_sum += r_minus_6
                     group_score_sum += score
-
                     distances.append(distance)
 
                     pairwise_contributions.append(
@@ -370,7 +448,6 @@ def calculate_noe_for_group_pairs(
             else:
                 min_distance = min(distances)
                 mean_distance = sum(distances) / len(distances)
-
                 group_r6_average = group_r6_sum / number_of_atom_pairs
                 group_score_average = group_score_sum / number_of_atom_pairs
 
@@ -673,16 +750,16 @@ available_props = get_available_sdf_properties(mols)
 
 if not available_props:
     st.error(
-        "No SDF properties were found. Energy values must be stored as SDF properties."
+        "No appropriate energy-like SDF properties were found. "
+        "Energy values must be stored as SDF properties."
     )
     st.stop()
 
-# Prefer common energy properties if present
 preferred_energy_props = [
     "TOTAL_GIBBS_FREE_ENERGY_KCAL/MOL",
     "POTENTIAL_ENERGY_KCAL/MOL",
-    "SCF_ENERGY",
     "SCF_ENERGY_HARTREE",
+    "SCF_ENERGY",
     "GIBBS_FREE_ENERGY",
 ]
 
@@ -702,15 +779,22 @@ energy_property = st.selectbox(
     ),
 )
 
-# Guess energy unit from property name
+if "POPULATION" in energy_property.upper() or "BOLTZMANN" in energy_property.upper():
+    st.error(
+        "The selected property appears to be a population, not an energy. "
+        "Please select an energy property such as POTENTIAL_ENERGY_KCAL/MOL "
+        "or TOTAL_GIBBS_FREE_ENERGY_KCAL/MOL."
+    )
+    st.stop()
+
 energy_property_upper = energy_property.upper()
 
 if "KCAL" in energy_property_upper:
-    default_unit_index = 1  # kcal/mol
+    default_unit_index = 1
 elif "KJ" in energy_property_upper:
-    default_unit_index = 2  # kJ/mol
+    default_unit_index = 2
 else:
-    default_unit_index = 0  # Hartree
+    default_unit_index = 0
 
 energy_unit = st.radio(
     "Energy unit",
@@ -963,9 +1047,72 @@ with tab1:
         mime="text/csv",
     )
 
+    st.subheader("Intuitive NOE likelihood interpretation")
+
+    for _, row in summary_df.iterrows():
+        pair_name = row["pair_name"]
+        score = row["NOE_likelihood_score_percent"]
+        normalized_distance = row["normalized_effective_NOE_distance_A"]
+        total_distance = row["effective_NOE_distance_A_total_r6"]
+        min_distance = row["minimum_H_H_distance_A"]
+
+        interpretation = interpret_noe_likelihood(
+            score_percent=score,
+            normalized_distance=normalized_distance,
+        )
+
+        st.markdown("---")
+        st.markdown(f"### {pair_name}")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                label="NOE likelihood score",
+                value=f"{score:.1f}%",
+            )
+
+        with col2:
+            if pd.notna(normalized_distance):
+                st.metric(
+                    label="Normalized effective distance",
+                    value=f"{normalized_distance:.2f} Å",
+                )
+            else:
+                st.metric(
+                    label="Normalized effective distance",
+                    value="N/A",
+                )
+
+        with col3:
+            if pd.notna(min_distance):
+                st.metric(
+                    label="Minimum H···H distance",
+                    value=f"{min_distance:.2f} Å",
+                )
+            else:
+                st.metric(
+                    label="Minimum H···H distance",
+                    value="N/A",
+                )
+
+        show_interpretation_box(interpretation)
+
+        if pd.notna(total_distance):
+            st.caption(
+                f"Total r⁻⁶ effective distance: {total_distance:.2f} Å. "
+                "The normalized effective distance is usually easier to compare with a single H···H distance "
+                "when equivalent protons are included."
+            )
+
+        st.caption(
+            "This score is an empirical distance- and population-based indicator, "
+            "not a true probability of NOE observation."
+        )
+
     st.markdown(
         """
-        **Interpretation**
+        **Interpretation notes**
 
         - `effective_NOE_distance_A_total_r6` is calculated from the total r⁻⁶ sum over all equivalent proton combinations.
         - `normalized_effective_NOE_distance_A` is calculated after dividing the r⁻⁶ sum by the number of evaluated atom pairs.
