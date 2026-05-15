@@ -1,3 +1,4 @@
+import json
 import math
 import re
 from io import BytesIO
@@ -5,11 +6,12 @@ from io import BytesIO
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 
-APP_VERSION = "ver. 1.3"
+APP_VERSION = "ver. 1.4"
 
 R_KCAL = 0.00198720425864083  # kcal mol^-1 K^-1
 
@@ -179,6 +181,120 @@ def calculate_boltzmann_populations(
         return [0.0 for _ in weights]
 
     return [w / total for w in weights]
+
+
+# =========================
+# 3D viewer functions
+# =========================
+
+def make_atom_labels_for_3dmol(mol, numbering_mode, label_mode):
+    """
+    Create label data for 3Dmol.js from the first conformer.
+    """
+    if mol.GetNumConformers() == 0:
+        return []
+
+    conf = mol.GetConformer()
+    labels = []
+
+    for atom in mol.GetAtoms():
+        idx0 = atom.GetIdx()
+        element = atom.GetSymbol()
+
+        if label_mode == "No labels":
+            continue
+
+        if label_mode == "H atoms only" and element != "H":
+            continue
+
+        atom_number = idx0 + 1 if numbering_mode == "1-based atom numbers" else idx0
+        pos = conf.GetAtomPosition(idx0)
+
+        labels.append(
+            {
+                "x": float(pos.x),
+                "y": float(pos.y),
+                "z": float(pos.z),
+                "label": f"{element}{atom_number}",
+                "element": element,
+                "atom_number": atom_number,
+            }
+        )
+
+    return labels
+
+
+def render_3dmol_viewer(mol, numbering_mode, label_mode, viewer_height=520):
+    """
+    Render the first conformer using 3Dmol.js.
+    """
+    molblock = Chem.MolToMolBlock(mol)
+    labels = make_atom_labels_for_3dmol(
+        mol=mol,
+        numbering_mode=numbering_mode,
+        label_mode=label_mode,
+    )
+
+    molblock_js = json.dumps(molblock)
+    labels_js = json.dumps(labels)
+
+    html = f"""
+    <div id="viewer3dmol" style="width: 100%; height: {viewer_height}px; position: relative;"></div>
+
+    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <script>
+    const molblock = {molblock_js};
+    const labels = {labels_js};
+
+    function makeViewer() {{
+        let element = document.getElementById("viewer3dmol");
+        let viewer = $3Dmol.createViewer(element, {{
+            backgroundColor: "white"
+        }});
+
+        viewer.addModel(molblock, "sdf");
+
+        viewer.setStyle({{}}, {{
+            stick: {{
+                radius: 0.15
+            }},
+            sphere: {{
+                scale: 0.22
+            }}
+        }});
+
+        labels.forEach(function(atom) {{
+            viewer.addLabel(atom.label, {{
+                position: {{
+                    x: atom.x,
+                    y: atom.y,
+                    z: atom.z
+                }},
+                fontSize: 12,
+                fontColor: "black",
+                backgroundColor: "white",
+                backgroundOpacity: 0.75,
+                borderThickness: 0.5,
+                borderColor: "black",
+                inFront: true,
+                showBackground: true
+            }});
+        }});
+
+        viewer.zoomTo();
+        viewer.render();
+    }}
+
+    if (typeof $3Dmol !== "undefined") {{
+        makeViewer();
+    }} else {{
+        document.getElementById("viewer3dmol").innerHTML =
+            "<p style='color:red;'>3Dmol.js could not be loaded.</p>";
+    }}
+    </script>
+    """
+
+    components.html(html, height=viewer_height + 20, scrolling=False)
 
 
 # =========================
@@ -410,8 +526,7 @@ def calculate_noe_for_group_pairs(
                         "distance_score": score,
                         "population_weighted_score": populations[conf_idx] * score,
                     }
-                    row_props = props.copy()
-                    pairwise_row.update(row_props)
+                    pairwise_row.update(props.copy())
                     pairwise_rows.append(pairwise_row)
 
             number_of_atom_pairs = len(pairwise_contributions)
@@ -460,8 +575,7 @@ def calculate_noe_for_group_pairs(
                 "population_weighted_group_score_average": populations[conf_idx] * group_score_average,
             }
 
-            row_props = props.copy()
-            detailed_row.update(row_props)
+            detailed_row.update(props.copy())
             detailed_rows.append(detailed_row)
 
     detailed_df = pd.DataFrame(detailed_rows)
@@ -524,7 +638,6 @@ def calculate_noe_for_group_pairs(
 
         first = group.iloc[0]
 
-        # Contact population based on conformer-level normalized effective distance.
         p_le_25 = group.loc[
             group["conformer_normalized_effective_distance_A"] <= 2.5,
             "population_percent",
@@ -617,7 +730,6 @@ def run_strictness_sensitivity(
             )
 
     sensitivity_df = pd.DataFrame(rows)
-
     summary_rows = []
 
     if sensitivity_df.empty:
@@ -742,6 +854,25 @@ show_atom_preview = st.sidebar.checkbox(
     value=True,
 )
 
+show_3d_viewer = st.sidebar.checkbox(
+    "Show 3D atom-numbering viewer",
+    value=True,
+)
+
+label_mode = st.sidebar.radio(
+    "3D viewer atom labels",
+    ["H atoms only", "All atoms", "No labels"],
+    index=0,
+)
+
+viewer_height = st.sidebar.slider(
+    "3D viewer height",
+    min_value=350,
+    max_value=800,
+    value=520,
+    step=50,
+)
+
 st.sidebar.header("Boltzmann settings")
 
 temperature = st.sidebar.number_input(
@@ -804,11 +935,33 @@ st.success(f"Successfully read {len(mols)} conformer(s) from the SDF file.")
 
 first_mol = mols[0]
 
-if show_atom_preview:
-    with st.expander("Atom-index preview for the first conformer", expanded=True):
+# =========================
+# Atom numbering helper
+# =========================
+
+st.header("Atom numbering helper")
+
+if show_3d_viewer:
+    with st.expander("3D viewer of the first conformer", expanded=True):
         st.write(
-            "Use this table to confirm atom numbering. "
-            "For GaussView/Gaussian atom numbers, use 1-based atom numbers."
+            "Use this 3D viewer to confirm atom numbers without opening external software. "
+            "The displayed structure is the first conformer in the uploaded SDF file."
+        )
+        render_3dmol_viewer(
+            mol=first_mol,
+            numbering_mode=numbering_mode,
+            label_mode=label_mode,
+            viewer_height=viewer_height,
+        )
+        st.caption(
+            "Tip: Use 'H atoms only' for NOE analysis. "
+            "If labels overlap, rotate or zoom the model in the viewer."
+        )
+
+if show_atom_preview:
+    with st.expander("Atom-index table for the first conformer", expanded=False):
+        st.write(
+            "This table can be used together with the 3D viewer to confirm atom numbering."
         )
         atom_df = make_atom_index_preview(first_mol)
         st.dataframe(atom_df, use_container_width=True)
@@ -1495,6 +1648,8 @@ st.caption(
     "Notes: This app predicts NOE likelihood from conformer populations and H···H distances. "
     "Equivalent proton inputs are treated by summing r⁻⁶ contributions over all specified atom-pair combinations. "
     "Contact population, robustness index, and strictness sensitivity are intended to help evaluate reliability. "
+    "The 3D viewer is used only for atom-number confirmation; NOE calculations use the original 3D coordinates "
+    "stored in the uploaded SDF file. "
     "The app does not explicitly account for spin diffusion, mixing time, molecular correlation time, signal overlap, "
     "exchangeable protons, or relaxation mechanisms. Use the output as a conformational and geometrical guide, "
     "not as definitive proof."
