@@ -9,7 +9,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 
-APP_VERSION = "ver. 1.2"
+APP_VERSION = "ver. 1.3"
 
 R_KCAL = 0.00198720425864083  # kcal mol^-1 K^-1
 
@@ -59,21 +59,15 @@ def make_atom_index_preview(mol):
 
 def read_sdf(uploaded_file, sanitize=False):
     sdf_bytes = uploaded_file.getvalue()
-
     supplier = Chem.ForwardSDMolSupplier(
         BytesIO(sdf_bytes),
         sanitize=sanitize,
         removeHs=False,
     )
-
     return [mol for mol in supplier if mol is not None]
 
 
 def get_available_sdf_properties(mols):
-    """
-    Get SDF properties that are likely to contain conformer energies.
-    Population-related properties are excluded.
-    """
     prop_names = set()
 
     for mol in mols:
@@ -120,10 +114,6 @@ def get_available_sdf_properties(mols):
 
 
 def extract_energy_from_property(mol, property_name):
-    """
-    Extract numeric energy from an SDF property.
-    The first numeric value is used.
-    """
     if not mol.HasProp(property_name):
         return None
 
@@ -146,9 +136,6 @@ def extract_energy_from_property(mol, property_name):
 
 
 def convert_energy_to_kcal_relative(energies, energy_unit):
-    """
-    Convert absolute energies to relative energies in kcal/mol.
-    """
     df = pd.DataFrame({"energy_raw": energies})
 
     if df["energy_raw"].isna().any():
@@ -175,13 +162,6 @@ def calculate_boltzmann_populations(
     strictness_factor,
     energy_window,
 ):
-    """
-    Calculate Boltzmann populations.
-
-    strictness_factor:
-        1.0 = normal Boltzmann distribution
-        >1.0 = softer energy penalty
-    """
     weights = []
 
     for dE in relative_energies_kcal:
@@ -206,10 +186,6 @@ def calculate_boltzmann_populations(
 # =========================
 
 def distance_to_score(distance):
-    """
-    Empirical conformer-level NOE score.
-    This is not a physical probability.
-    """
     if distance <= 2.5:
         return 1.0
     if distance <= 3.0:
@@ -236,10 +212,6 @@ def classify_effective_distance(r_eff):
 
 
 def interpret_noe_likelihood(score_percent, normalized_distance):
-    """
-    Generate an intuitive interpretation of the NOE likelihood score.
-    The score is empirical and should not be interpreted as a true probability.
-    """
     if normalized_distance is not None and pd.notna(normalized_distance):
         if normalized_distance > 4.0:
             return {
@@ -277,7 +249,8 @@ def interpret_noe_likelihood(score_percent, normalized_distance):
             "style": "info",
             "comment": (
                 "This proton pair may show a weak NOE correlation, but a strong NOE is not expected. "
-                "The result should be interpreted together with the effective distance and conformer populations."
+                "The result should be interpreted together with the effective distance, contact population, "
+                "and robustness index."
             ),
         }
 
@@ -314,6 +287,37 @@ def show_interpretation_box(interpretation):
         st.error(text)
 
 
+def interpret_contact_population(p30, p35, p40):
+    if p30 >= 50:
+        return "Many populated conformers have H···H distances within 3.0 Å. The NOE prediction is geometrically well supported."
+    if p35 >= 50:
+        return "A substantial fraction of the conformer ensemble falls within the weak-to-moderate NOE distance range."
+    if p40 >= 50:
+        return "Many conformers are within the borderline NOE range, but close-contact conformers are limited."
+    return "Only a small fraction of the conformer ensemble shows close H···H contact. The NOE prediction may depend on minor conformers."
+
+
+def interpret_robustness(largest_contribution_percent):
+    if largest_contribution_percent is None or pd.isna(largest_contribution_percent):
+        return "Robustness could not be evaluated."
+
+    if largest_contribution_percent < 20:
+        return "Robust prediction: the NOE contribution is distributed over several conformers/atom pairs."
+    if largest_contribution_percent < 50:
+        return "Moderately robust prediction: the NOE contribution is somewhat concentrated but not dominated by a single contribution."
+    if largest_contribution_percent < 80:
+        return "Energy-sensitive prediction: the NOE contribution is strongly dependent on a limited number of conformers/atom pairs."
+    return "Highly sensitive prediction: the NOE contribution is dominated by a single conformer/atom pair and should be interpreted cautiously."
+
+
+def interpret_strictness_sensitivity(score_range, distance_range):
+    if score_range < 10 and distance_range < 0.20:
+        return "Robust to energy strictness: the prediction is relatively insensitive to conformer population smoothing."
+    if score_range < 25 and distance_range < 0.50:
+        return "Moderately sensitive to energy strictness: the prediction changes somewhat with population assumptions."
+    return "Sensitive to energy strictness: the prediction depends strongly on how conformer energy differences are weighted."
+
+
 # =========================
 # NOE calculation
 # =========================
@@ -338,16 +342,6 @@ def calculate_noe_for_group_pairs(
     energy_values,
     include_props,
 ):
-    """
-    Calculate NOE-related quantities for proton groups.
-
-    For each NOE definition:
-        group_A_atoms = [H1, equivalent H1, ...]
-        group_B_atoms = [H2, equivalent H2, ...]
-
-    For each conformer:
-        group_r6_sum = sum over all A-B combinations of r^-6
-    """
     detailed_rows = []
     pairwise_rows = []
 
@@ -367,20 +361,8 @@ def calculate_noe_for_group_pairs(
             group_A_idx = convert_to_zero_based(group_A_input, numbering_mode)
             group_B_idx = convert_to_zero_based(group_B_input, numbering_mode)
 
-            validate_atom_group(
-                group_A_idx,
-                mol,
-                "Proton A group",
-                pair_name,
-                mol_name,
-            )
-            validate_atom_group(
-                group_B_idx,
-                mol,
-                "Proton B group",
-                pair_name,
-                mol_name,
-            )
+            validate_atom_group(group_A_idx, mol, "Proton A group", pair_name, mol_name)
+            validate_atom_group(group_B_idx, mol, "Proton B group", pair_name, mol_name)
 
             group_r6_sum = 0.0
             group_score_sum = 0.0
@@ -393,12 +375,7 @@ def calculate_noe_for_group_pairs(
                         continue
 
                     distance = rdMolTransforms.GetBondLength(conf, a_idx, b_idx)
-
-                    if distance <= 0:
-                        r_minus_6 = 0.0
-                    else:
-                        r_minus_6 = distance ** -6
-
+                    r_minus_6 = distance ** -6 if distance > 0 else 0.0
                     score = distance_to_score(distance)
 
                     group_r6_sum += r_minus_6
@@ -433,7 +410,8 @@ def calculate_noe_for_group_pairs(
                         "distance_score": score,
                         "population_weighted_score": populations[conf_idx] * score,
                     }
-                    pairwise_row.update(props)
+                    row_props = props.copy()
+                    pairwise_row.update(row_props)
                     pairwise_rows.append(pairwise_row)
 
             number_of_atom_pairs = len(pairwise_contributions)
@@ -458,7 +436,7 @@ def calculate_noe_for_group_pairs(
                     group_r6_average ** (-1 / 6) if group_r6_average > 0 else None
                 )
 
-            row = {
+            detailed_row = {
                 "pair_name": pair_name,
                 "group_A_atoms": ",".join(map(str, group_A_input)),
                 "group_B_atoms": ",".join(map(str, group_B_input)),
@@ -482,8 +460,9 @@ def calculate_noe_for_group_pairs(
                 "population_weighted_group_score_average": populations[conf_idx] * group_score_average,
             }
 
-            row.update(props)
-            detailed_rows.append(row)
+            row_props = props.copy()
+            detailed_row.update(row_props)
+            detailed_rows.append(detailed_row)
 
     detailed_df = pd.DataFrame(detailed_rows)
     pairwise_df = pd.DataFrame(pairwise_rows)
@@ -498,15 +477,10 @@ def calculate_noe_for_group_pairs(
         weighted_r6_average = group["population_weighted_group_r_minus_6_average"].sum()
         weighted_score_average = group["population_weighted_group_score_average"].sum()
 
-        if weighted_r6_sum > 0:
-            effective_distance = weighted_r6_sum ** (-1 / 6)
-        else:
-            effective_distance = None
-
-        if weighted_r6_average > 0:
-            normalized_effective_distance = weighted_r6_average ** (-1 / 6)
-        else:
-            normalized_effective_distance = None
+        effective_distance = weighted_r6_sum ** (-1 / 6) if weighted_r6_sum > 0 else None
+        normalized_effective_distance = (
+            weighted_r6_average ** (-1 / 6) if weighted_r6_average > 0 else None
+        )
 
         if normalized_effective_distance is not None:
             prediction = classify_effective_distance(normalized_effective_distance)
@@ -525,18 +499,15 @@ def calculate_noe_for_group_pairs(
                 pairwise_group["population_weighted_r_minus_6"].idxmax()
             ]
 
-            total_pairwise_weighted_r6 = pairwise_group[
-                "population_weighted_r_minus_6"
-            ].sum()
+            total_pairwise_weighted_r6 = pairwise_group["population_weighted_r_minus_6"].sum()
 
-            if total_pairwise_weighted_r6 > 0:
-                largest_contribution_percent = (
-                    largest_contribution_row["population_weighted_r_minus_6"]
-                    / total_pairwise_weighted_r6
-                    * 100
-                )
-            else:
-                largest_contribution_percent = None
+            largest_contribution_percent = (
+                largest_contribution_row["population_weighted_r_minus_6"]
+                / total_pairwise_weighted_r6
+                * 100
+                if total_pairwise_weighted_r6 > 0
+                else None
+            )
 
             minimum_distance = closest_row["H_H_distance_A"]
             closest_conformer = closest_row["conformer_name"]
@@ -553,6 +524,24 @@ def calculate_noe_for_group_pairs(
 
         first = group.iloc[0]
 
+        # Contact population based on conformer-level normalized effective distance.
+        p_le_25 = group.loc[
+            group["conformer_normalized_effective_distance_A"] <= 2.5,
+            "population_percent",
+        ].sum()
+        p_le_30 = group.loc[
+            group["conformer_normalized_effective_distance_A"] <= 3.0,
+            "population_percent",
+        ].sum()
+        p_le_35 = group.loc[
+            group["conformer_normalized_effective_distance_A"] <= 3.5,
+            "population_percent",
+        ].sum()
+        p_le_40 = group.loc[
+            group["conformer_normalized_effective_distance_A"] <= 4.0,
+            "population_percent",
+        ].sum()
+
         summary_rows.append(
             {
                 "pair_name": pair_name,
@@ -563,18 +552,102 @@ def calculate_noe_for_group_pairs(
                 "normalized_effective_NOE_distance_A": normalized_effective_distance,
                 "NOE_likelihood_score_percent": likelihood_score,
                 "prediction": prediction,
+                "contact_population_le_2_5_A_percent": p_le_25,
+                "contact_population_le_3_0_A_percent": p_le_30,
+                "contact_population_le_3_5_A_percent": p_le_35,
+                "contact_population_le_4_0_A_percent": p_le_40,
                 "minimum_H_H_distance_A": minimum_distance,
                 "closest_atom_pair": closest_atom_pair,
                 "closest_conformer": closest_conformer,
                 "largest_NOE_contribution_atom_pair": largest_contribution_atom_pair,
                 "largest_NOE_contribution_conformer": largest_contribution_conformer,
                 "largest_NOE_contribution_percent_of_total_r6": largest_contribution_percent,
+                "robustness_comment": interpret_robustness(largest_contribution_percent),
+                "contact_population_comment": interpret_contact_population(p_le_30, p_le_35, p_le_40),
             }
         )
 
     summary_df = pd.DataFrame(summary_rows)
 
     return summary_df, detailed_df, pairwise_df
+
+
+def run_strictness_sensitivity(
+    mols,
+    pair_definitions,
+    numbering_mode,
+    relative_energies_kcal,
+    energy_values,
+    temperature,
+    energy_window,
+):
+    strictness_values = [1.0, 2.0, 5.0]
+    rows = []
+
+    for strictness in strictness_values:
+        populations = calculate_boltzmann_populations(
+            relative_energies_kcal=relative_energies_kcal,
+            temperature=temperature,
+            strictness_factor=strictness,
+            energy_window=energy_window,
+        )
+
+        summary_df, _, _ = calculate_noe_for_group_pairs(
+            mols=mols,
+            pair_definitions=pair_definitions,
+            numbering_mode=numbering_mode,
+            populations=populations,
+            relative_energies_kcal=relative_energies_kcal,
+            energy_values=energy_values,
+            include_props=False,
+        )
+
+        for _, row in summary_df.iterrows():
+            rows.append(
+                {
+                    "pair_name": row["pair_name"],
+                    "strictness_factor": strictness,
+                    "normalized_effective_NOE_distance_A": row["normalized_effective_NOE_distance_A"],
+                    "NOE_likelihood_score_percent": row["NOE_likelihood_score_percent"],
+                    "prediction": row["prediction"],
+                    "contact_population_le_3_0_A_percent": row["contact_population_le_3_0_A_percent"],
+                    "contact_population_le_3_5_A_percent": row["contact_population_le_3_5_A_percent"],
+                    "largest_NOE_contribution_percent_of_total_r6": row["largest_NOE_contribution_percent_of_total_r6"],
+                }
+            )
+
+    sensitivity_df = pd.DataFrame(rows)
+
+    summary_rows = []
+
+    if sensitivity_df.empty:
+        return sensitivity_df, pd.DataFrame()
+
+    for pair_name, group in sensitivity_df.groupby("pair_name"):
+        score_range = (
+            group["NOE_likelihood_score_percent"].max()
+            - group["NOE_likelihood_score_percent"].min()
+        )
+        distance_range = (
+            group["normalized_effective_NOE_distance_A"].max()
+            - group["normalized_effective_NOE_distance_A"].min()
+        )
+
+        summary_rows.append(
+            {
+                "pair_name": pair_name,
+                "score_range_percent_points": score_range,
+                "normalized_distance_range_A": distance_range,
+                "strictness_sensitivity_comment": interpret_strictness_sensitivity(
+                    score_range,
+                    distance_range,
+                ),
+            }
+        )
+
+    sensitivity_summary_df = pd.DataFrame(summary_rows)
+
+    return sensitivity_df, sensitivity_summary_df
 
 
 def make_wide_table(df, value_column):
@@ -652,16 +725,11 @@ numbering_mode = st.sidebar.radio(
     "Atom numbering in your input",
     ["1-based atom numbers", "0-based RDKit atom indices"],
     index=0,
-    help=(
-        "Use 1-based atom numbers when specifying atom numbers from Gaussian, "
-        "GaussView, Chem3D, Avogadro, etc."
-    ),
 )
 
 sanitize = st.sidebar.checkbox(
     "Sanitize SDF while reading",
     value=False,
-    help="If SDF reading fails, try turning this off.",
 )
 
 include_props = st.sidebar.checkbox(
@@ -692,8 +760,7 @@ strictness_factor = st.sidebar.slider(
     step=0.5,
     help=(
         "1.0 gives a normal Boltzmann distribution. "
-        "Larger values reduce the effect of energy differences. "
-        "This is useful when conformer energies are considered uncertain."
+        "Larger values reduce the effect of energy differences."
     ),
 )
 
@@ -703,7 +770,14 @@ energy_window = st.sidebar.number_input(
     max_value=100.0,
     value=10.0,
     step=0.5,
-    help="Conformers above this relative energy are assigned zero population.",
+)
+
+st.sidebar.header("Advanced analysis")
+
+run_sensitivity = st.sidebar.checkbox(
+    "Run strictness sensitivity analysis",
+    value=True,
+    help="Automatically compares strictness factors 1.0, 2.0, and 5.0.",
 )
 
 
@@ -773,10 +847,6 @@ energy_property = st.selectbox(
     "SDF property containing energy values",
     available_props,
     index=default_energy_index,
-    help=(
-        "Select the SDF property that contains SCF energy, potential energy, "
-        "or Gibbs free energy. Do not select Boltzmann population."
-    ),
 )
 
 if "POPULATION" in energy_property.upper() or "BOLTZMANN" in energy_property.upper():
@@ -812,7 +882,6 @@ if any(x is None for x in energy_values):
     st.error(
         "Some conformers do not have valid numeric energy values in the selected property."
     )
-
     energy_check_df = pd.DataFrame(
         {
             "conformer_index": list(range(1, len(mols) + 1)),
@@ -865,8 +934,7 @@ st.header("2. Define H···H pairs")
 
 st.write(
     "Enter the two proton atom numbers. "
-    "If equivalent protons should be considered, add them using the buttons below. "
-    "Only the protons relevant to the NOE correlation need to be entered."
+    "If equivalent protons should be considered, add them using the buttons below."
 )
 
 pair_name = st.text_input(
@@ -1025,14 +1093,34 @@ except Exception as e:
     st.error(f"Calculation error: {e}")
     st.stop()
 
+if run_sensitivity:
+    try:
+        sensitivity_df, sensitivity_summary_df = run_strictness_sensitivity(
+            mols=mols,
+            pair_definitions=pair_definitions,
+            numbering_mode=numbering_mode,
+            relative_energies_kcal=relative_energies_kcal,
+            energy_values=energy_values,
+            temperature=temperature,
+            energy_window=energy_window,
+        )
+    except Exception as e:
+        st.warning(f"Strictness sensitivity analysis failed: {e}")
+        sensitivity_df = pd.DataFrame()
+        sensitivity_summary_df = pd.DataFrame()
+else:
+    sensitivity_df = pd.DataFrame()
+    sensitivity_summary_df = pd.DataFrame()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "Summary",
         "Conformer-level table",
         "Atom-pair details",
         "Wide tables",
         "Plots",
+        "Strictness sensitivity",
     ]
 )
 
@@ -1067,36 +1155,72 @@ with tab1:
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.metric(
-                label="NOE likelihood score",
-                value=f"{score:.1f}%",
-            )
+            st.metric("NOE likelihood score", f"{score:.1f}%")
 
         with col2:
             if pd.notna(normalized_distance):
-                st.metric(
-                    label="Normalized effective distance",
-                    value=f"{normalized_distance:.2f} Å",
-                )
+                st.metric("Normalized effective distance", f"{normalized_distance:.2f} Å")
             else:
-                st.metric(
-                    label="Normalized effective distance",
-                    value="N/A",
-                )
+                st.metric("Normalized effective distance", "N/A")
 
         with col3:
             if pd.notna(min_distance):
-                st.metric(
-                    label="Minimum H···H distance",
-                    value=f"{min_distance:.2f} Å",
-                )
+                st.metric("Minimum H···H distance", f"{min_distance:.2f} Å")
             else:
-                st.metric(
-                    label="Minimum H···H distance",
-                    value="N/A",
-                )
+                st.metric("Minimum H···H distance", "N/A")
 
         show_interpretation_box(interpretation)
+
+        st.markdown("#### Contact population")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("≤2.5 Å", f"{row['contact_population_le_2_5_A_percent']:.1f}%")
+        with c2:
+            st.metric("≤3.0 Å", f"{row['contact_population_le_3_0_A_percent']:.1f}%")
+        with c3:
+            st.metric("≤3.5 Å", f"{row['contact_population_le_3_5_A_percent']:.1f}%")
+        with c4:
+            st.metric("≤4.0 Å", f"{row['contact_population_le_4_0_A_percent']:.1f}%")
+
+        st.info(row["contact_population_comment"])
+
+        st.markdown("#### Robustness index")
+
+        robustness_value = row["largest_NOE_contribution_percent_of_total_r6"]
+        if pd.notna(robustness_value):
+            st.metric(
+                "Largest single r⁻⁶ contribution",
+                f"{robustness_value:.1f}%",
+            )
+        else:
+            st.metric("Largest single r⁻⁶ contribution", "N/A")
+
+        st.write(row["robustness_comment"])
+
+        if run_sensitivity and not sensitivity_summary_df.empty:
+            sens_row = sensitivity_summary_df[
+                sensitivity_summary_df["pair_name"] == pair_name
+            ]
+
+            if not sens_row.empty:
+                sens_row = sens_row.iloc[0]
+
+                st.markdown("#### Strictness sensitivity")
+
+                s1, s2 = st.columns(2)
+                with s1:
+                    st.metric(
+                        "Score range",
+                        f"{sens_row['score_range_percent_points']:.1f} points",
+                    )
+                with s2:
+                    st.metric(
+                        "Distance range",
+                        f"{sens_row['normalized_distance_range_A']:.2f} Å",
+                    )
+
+                st.warning(sens_row["strictness_sensitivity_comment"])
 
         if pd.notna(total_distance):
             st.caption(
@@ -1106,7 +1230,7 @@ with tab1:
             )
 
         st.caption(
-            "This score is an empirical distance- and population-based indicator, "
+            "The NOE likelihood score is an empirical distance- and population-based indicator, "
             "not a true probability of NOE observation."
         )
 
@@ -1114,10 +1238,9 @@ with tab1:
         """
         **Interpretation notes**
 
-        - `effective_NOE_distance_A_total_r6` is calculated from the total r⁻⁶ sum over all equivalent proton combinations.
-        - `normalized_effective_NOE_distance_A` is calculated after dividing the r⁻⁶ sum by the number of evaluated atom pairs.
-        - For comparison with ordinary single H···H distances, `normalized_effective_NOE_distance_A` is usually easier to interpret.
-        - `NOE_likelihood_score_percent` is an empirical distance- and population-based score, not a true observation probability.
+        - `contact_population_le_3_0_A_percent` indicates the Boltzmann population of conformers in which the conformer-level normalized effective H···H distance is ≤3.0 Å.
+        - `largest_NOE_contribution_percent_of_total_r6` indicates whether the NOE prediction is dominated by a single conformer/atom-pair contribution.
+        - `strictness sensitivity` compares results under energy strictness factors 1.0, 2.0, and 5.0.
         """
     )
 
@@ -1134,12 +1257,10 @@ with tab2:
 
 with tab3:
     st.subheader("Atom-pair-level details")
-
     st.write(
         "This table shows every actual H···H atom-pair combination generated "
         "from equivalent proton inputs."
     )
-
     st.dataframe(pairwise_df, use_container_width=True)
 
     st.download_button(
@@ -1213,7 +1334,6 @@ with tab5:
             )
             .interactive()
         )
-
         st.altair_chart(distance_chart, use_container_width=True)
 
         st.markdown("**Population-weighted group r⁻⁶ contribution by conformer**")
@@ -1234,16 +1354,12 @@ with tab5:
                     "group_B_atoms",
                     "conformer_index",
                     "conformer_name",
-                    alt.Tooltip(
-                        "population_weighted_group_r_minus_6_sum:Q",
-                        format=".6g",
-                    ),
+                    alt.Tooltip("population_weighted_group_r_minus_6_sum:Q", format=".6g"),
                     alt.Tooltip("population_percent:Q", format=".2f"),
                 ],
             )
             .interactive()
         )
-
         st.altair_chart(r6_chart, use_container_width=True)
 
     if not pairwise_df.empty:
@@ -1267,14 +1383,94 @@ with tab5:
             )
             .interactive()
         )
-
         st.altair_chart(pairwise_chart, use_container_width=True)
+
+with tab6:
+    st.subheader("Strictness sensitivity analysis")
+
+    if not run_sensitivity:
+        st.info("Strictness sensitivity analysis is turned off in the sidebar.")
+    elif sensitivity_df.empty:
+        st.warning("No strictness sensitivity results are available.")
+    else:
+        st.write(
+            "This analysis recalculates NOE metrics using energy strictness factors "
+            "1.0, 2.0, and 5.0. Larger differences indicate stronger dependence on "
+            "the conformer population model."
+        )
+
+        st.markdown("**Sensitivity summary**")
+        st.dataframe(sensitivity_summary_df, use_container_width=True)
+
+        st.download_button(
+            label="Download strictness sensitivity summary as CSV",
+            data=convert_df_to_csv_bytes(sensitivity_summary_df),
+            file_name="noe_strictness_sensitivity_summary.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("**Sensitivity details**")
+        st.dataframe(sensitivity_df, use_container_width=True)
+
+        st.download_button(
+            label="Download strictness sensitivity details as CSV",
+            data=convert_df_to_csv_bytes(sensitivity_df),
+            file_name="noe_strictness_sensitivity_details.csv",
+            mime="text/csv",
+        )
+
+        score_chart = (
+            alt.Chart(sensitivity_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("strictness_factor:Q", title="Energy strictness factor"),
+                y=alt.Y(
+                    "NOE_likelihood_score_percent:Q",
+                    title="NOE likelihood score / %",
+                ),
+                color=alt.Color("pair_name:N", title="NOE pair"),
+                tooltip=[
+                    "pair_name",
+                    "strictness_factor",
+                    alt.Tooltip("NOE_likelihood_score_percent:Q", format=".2f"),
+                    alt.Tooltip("normalized_effective_NOE_distance_A:Q", format=".3f"),
+                    "prediction",
+                ],
+            )
+            .interactive()
+        )
+
+        st.altair_chart(score_chart, use_container_width=True)
+
+        distance_chart = (
+            alt.Chart(sensitivity_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("strictness_factor:Q", title="Energy strictness factor"),
+                y=alt.Y(
+                    "normalized_effective_NOE_distance_A:Q",
+                    title="Normalized effective distance / Å",
+                ),
+                color=alt.Color("pair_name:N", title="NOE pair"),
+                tooltip=[
+                    "pair_name",
+                    "strictness_factor",
+                    alt.Tooltip("normalized_effective_NOE_distance_A:Q", format=".3f"),
+                    alt.Tooltip("NOE_likelihood_score_percent:Q", format=".2f"),
+                    "prediction",
+                ],
+            )
+            .interactive()
+        )
+
+        st.altair_chart(distance_chart, use_container_width=True)
 
 st.divider()
 
 st.caption(
     "Notes: This app predicts NOE likelihood from conformer populations and H···H distances. "
     "Equivalent proton inputs are treated by summing r⁻⁶ contributions over all specified atom-pair combinations. "
+    "Contact population, robustness index, and strictness sensitivity are intended to help evaluate reliability. "
     "The app does not explicitly account for spin diffusion, mixing time, molecular correlation time, signal overlap, "
     "exchangeable protons, or relaxation mechanisms. Use the output as a conformational and geometrical guide, "
     "not as definitive proof."
