@@ -1013,7 +1013,7 @@ preview_df = pd.DataFrame(
 )
 st.dataframe(preview_df, use_container_width=True)
 
-col_add, col_clear_eq, col_clear_all = st.columns(3)
+col_add, col_clear_eq = st.columns(2)
 
 with col_add:
     if st.button("Add NOE pair"):
@@ -1040,12 +1040,6 @@ with col_add:
 
 with col_clear_eq:
     if st.button("Clear equivalent proton fields"):
-        reset_current_equivalent_fields()
-        st.rerun()
-
-with col_clear_all:
-    if st.button("Clear all NOE pairs"):
-        st.session_state.noe_pairs = []
         reset_current_equivalent_fields()
         st.rerun()
 
