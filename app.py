@@ -1055,16 +1055,46 @@ if st.session_state.noe_pairs:
     pair_table = pd.DataFrame(
         [
             {
+                "index": i,
                 "pair_name": p["name"],
                 "proton_A_group": ",".join(map(str, p["group_A_atoms"])),
                 "proton_B_group": ",".join(map(str, p["group_B_atoms"])),
                 "number_of_atom_pairs": len(p["group_A_atoms"]) * len(p["group_B_atoms"]),
             }
-            for p in st.session_state.noe_pairs
+            for i, p in enumerate(st.session_state.noe_pairs)
         ]
     )
 
-    st.dataframe(pair_table, use_container_width=True)
+    st.dataframe(pair_table.drop(columns=["index"]), use_container_width=True)
+
+    st.markdown("**Delete selected NOE pair**")
+
+    pair_options = [
+        f"{i + 1}. {p['name']} | A: {','.join(map(str, p['group_A_atoms']))} | B: {','.join(map(str, p['group_B_atoms']))}"
+        for i, p in enumerate(st.session_state.noe_pairs)
+    ]
+
+    selected_pair_label = st.selectbox(
+        "Select a NOE pair to delete",
+        pair_options,
+        key="selected_pair_to_delete",
+    )
+
+    selected_pair_index = pair_options.index(selected_pair_label)
+
+    col_delete_one, col_delete_all = st.columns(2)
+
+    with col_delete_one:
+        if st.button("Delete selected NOE pair"):
+            deleted_pair = st.session_state.noe_pairs.pop(selected_pair_index)
+            st.success(f"Deleted NOE pair: {deleted_pair['name']}")
+            st.rerun()
+
+    with col_delete_all:
+        if st.button("Clear all NOE pairs"):
+            st.session_state.noe_pairs = []
+            reset_current_equivalent_fields()
+            st.rerun()
 
 pair_definitions = st.session_state.noe_pairs
 
